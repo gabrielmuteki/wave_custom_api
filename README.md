@@ -316,8 +316,6 @@ echo json_encode(['status' => 'success']);
 
 Cette intégration simple permet de commencer rapidement avec Wave tout en gardant la possibilité d'ajouter des fonctionnalités plus avancées selon vos besoins.
 
-# URL de la page de test
-https://epsie.com/test/
 
 ### Transactions
 
