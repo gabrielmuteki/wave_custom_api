@@ -1,0 +1,217 @@
+### Guide de Développement de l'API de Simulation de Paiement (Inspirée de Wave)
+
+#### **1. Introduction**  
+**Objectif** : Développer une API de simulation de paiement pour tester les transactions de l'application mobile STAN VTC sans utiliser l'API réelle de Wave.  
+**Fonctionnalités clés** :
+- Création de sessions de paiement
+- Redirection vers des pages de succès/échec
+- Gestion de webhooks pour les notifications
+- Authentification par clé API
+
+---
+
+#### **2. Architecture Technique**  
+**Stack** :  
+- **Langage** : PHP 8.0+  
+- **Base de données** : MySQL (PDO)  
+- **Modèle** : MVC (Modèle-Vue-Contrôleur)  
+- **Endpoints** :  
+  - Racine : `https://epsie.com/wave/api`  
+  - Pages : `epsie.com/wave/success` et `epsie.com/wave/error`  
+
+
+---
+
+#### **3. Workflow de Paiement**  
+1. **Création de session** :  
+   - L'app mobile envoie une requête POST à `/v1/checkout/sessions`.
+   - Validation des paramètres obligatoires :  
+     ```json
+     {
+       "amount": "1000",      // Montant en centimes
+       "currency": "XOF",
+       "success_url": "https://epsie.com/wave/success",
+       "error_url": "https://epsie.com/wave/error",
+       "client_reference": "ref_123"  // Optionnel
+     }
+     ```
+   - Génération d'un `session_id` unique et d'une `wave_launch_url` (ex: `epsie.com/wave/payment?session_id=ABCD`).
+
+2. **Redirection utilisateur** :  
+   - L'app mobile ouvre `wave_launch_url` dans le navigateur.
+   - Simulation du processus de paiement via une interface web.
+
+3. **Notification webhook** :  
+   - Envoi automatique d'une requête POST à l'URL configurée avec le statut du paiement.
+
+---
+
+#### **4. Endpoints à Implémenter**  
+| Endpoint                     | Méthode | Description                                  |
+|------------------------------|---------|---------------------------------------------|
+| `/v1/checkout/sessions`      | POST    | Crée une session de paiement                |
+| `/wave/payment`              | GET     | Page de simulation de paiement              |
+| `/v1/webhook`                | POST    | Reçoit les notifications de paiement        |
+| `/v1/checkout/sessions/{id}` | GET     | Récupère le statut d'une session            |
+
+---
+
+#### **5. Détails Techniques**  
+**a. Création de Session (POST `/v1/checkout/sessions`)**  
+- **Authentification** :  
+  ```php
+  // Vérification du Bearer token
+  $apiKey = str_replace('Bearer ', '', $_SERVER['HTTP_AUTHORIZATION']);
+  if (!$this->isValidApiKey($apiKey)) {
+      http_response_code(401);
+      echo json_encode(["error" => "Clé API invalide"]);
+      exit;
+  }
+  ```
+- **Réponse réussie** :  
+  ```json
+  {
+    "id": "session_123",
+    "wave_launch_url": "https://epsie.com/wave/payment?session_id=session_123",
+    "amount": "1000",
+    "currency": "XOF",
+    "status": "open"
+  }
+  ```
+
+**b. Page de Simulation de Paiement**  
+- Interface web avec deux boutons :  
+  ```html
+  <button onclick="simulatePayment('success')">Paiement Réussi</button>
+  <button onclick="simulatePayment('error')">Paiement Échoué</button>
+  ```
+- Script de redirection :  
+  ```javascript
+  function simulatePayment(status) {
+    const sessionId = new URLSearchParams(window.location.search).get('session_id');
+    fetch(`/wave/api/update-payment?session_id=${sessionId}&status=${status}`);
+    window.location.href = (status === 'success') 
+      ? 'https://epsie.com/wave/success' 
+      : 'https://epsie.com/wave/error';
+  }
+  ```
+
+**c. Webhook (POST `/v1/webhook`)**  
+- **Structure de payload** :  
+  ```json
+  {
+    "session_id": "session_123",
+    "status": "successful",
+    "amount": "1000",
+    "currency": "XOF",
+    "reference": "ref_123"
+  }
+  ```
+- **Sécurité** :  
+  Valider l'origine avec une signature HMAC (optionnel).
+
+---
+
+#### **6. Modèle de Données**  
+**Table `payment_sessions`** :
+| Champ             | Type         | Description                     |
+|-------------------|--------------|---------------------------------|
+| id                | VARCHAR(255) | ID unique de session            |
+| amount            | INT          | Montant en centimes             |
+| currency          | CHAR(3)      | Devise (ex: XOF)                |
+| success_url       | TEXT         | URL de redirection (succès)     |
+| error_url         | TEXT         | URL de redirection (erreur)     |
+| client_reference  | VARCHAR(255) | Référence client (optionnel)    |
+| status            | ENUM         | open, success, error, expired   |
+| created_at        | DATETIME     | Date de création                |
+
+---
+
+#### **7. Sécurité**  
+- **HTTPS obligatoire** :  
+  Toutes les requêtes doivent utiliser HTTPS.
+- **Gestion des clés API** :  
+  - Stocker les clés en base de données (table `api_keys`).
+  - Rotation mensuelle des clés.
+- **Validation des entrées** :  
+  ```php
+  $amount = filter_input(INPUT_POST, 'amount', FILTER_VALIDATE_INT);
+  if ($amount <= 0) {
+      http_response_code(400);
+      echo json_encode(["error" => "Montant invalide"]);
+      exit;
+  }
+  ```
+
+---
+
+#### **8. Gestion des Erreurs**  
+| Code HTTP | Erreur                 | Solution                          |
+|-----------|------------------------|-----------------------------------|
+| 400       | Requête mal formée     | Vérifier les paramètres d'entrée  |
+| 401       | Clé API invalide       | Régénérer la clé API              |
+| 429       | Trop de requêtes       | Implémenter un rate limiting      |
+| 500       | Erreur serveur         | Journaliser l'erreur              |
+
+---
+
+#### **9. Tests**  
+**Scénarios à couvrir** :  
+1. Création de session avec paramètres valides.
+2. Simulation de paiement réussi/échoué.
+3. Vérification du webhook reçu.
+4. Test de rate limiting (max. 50 req/min).
+
+**Outils** :  
+- Postman pour les tests d'endpoints.
+- PHPUnit pour les tests unitaires.
+
+---
+
+#### **10. Déploiement**  
+**Prérequis serveur** :  
+- PHP 8.0+ avec extensions PDO, JSON.
+- Base de données MySQL.
+- Certificat SSL valide.
+
+**Procédure** :  
+1. Cloner le dépôt Git sur le serveur.
+2. Configurer les variables d'environnement :
+   ```env
+   DB_HOST=localhost
+   DB_NAME=wave_sim
+   DB_USER=user
+   DB_PASSWORD=secret
+   API_KEY_SECRET=your_secret
+   ```
+3. Exécuter les migrations SQL pour créer les tables.
+
+---
+
+#### **11. Documentation Technique Supplémentaire**  
+- **Exemple de requête POST** :
+  ```bash
+  curl -X POST https://epsie.com/wave/api/v1/checkout/sessions \
+    -H "Authorization: Bearer YOUR_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"amount":"1000", "currency":"XOF", "success_url":"https://epsie.com/wave/success", "error_url":"https://epsie.com/wave/error"}'
+  ```
+- **Diagramme de séquence** :  
+  ```
+  App Mobile → API : POST /sessions
+  API → App Mobile : session_id + wave_launch_url
+  App Mobile → Navigateur : Ouvre wave_launch_url
+  Navigateur → API : GET /payment?session_id=...
+  Utilisateur → API : Clique sur "Succès" ou "Échec"
+  API → Webhook : POST /webhook (notification)
+  ```
+
+---
+
+**Livrables Attendus** :  
+1. Code source de l'API (dépôt Git).
+2. Scripts de déploiement automatisé.
+3. Documentation Postman complète.
+4. Plan de tests validant tous les cas d'usage.
+
+Ce document sert de référence pour l'équipe de développement. Toute divergence doit être discutée avec le responsable technique.

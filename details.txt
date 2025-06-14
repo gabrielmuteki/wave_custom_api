@@ -1,0 +1,861 @@
+# Guide de Développement - API Wave Simulation
+
+## I. PRÉSENTATION GÉNÉRALE
+
+### 1.1 Objectif du Projet
+Développer une API de simulation complète de l'API Wave permettant de tester les intégrations de paiement sans utiliser le système réel de Wave. Cette API simulera le comportement complet de l'API Wave Checkout en PHP avec une architecture MVC et PDO.
+
+### 1.2 Architecture Cible
+- **Langage** : PHP 8.x
+- **Base de données** : MySQL avec PDO
+- **Architecture** : MVC (Modèle-Vue-Contrôleur)
+- **URL racine** : `epsie.com/wave/api`
+- **Pages de redirection** : 
+  - Succès : `epsie.com/wave/success`
+  - Erreur : `epsie.com/wave/error`
+
+### 1.3 Fonctionnalités à Implémenter
+- Création de sessions de paiement (Checkout Sessions)
+- Simulation du processus de paiement
+- Gestion des webhooks
+- Interface de simulation pour les paiements
+- Système de notifications en temps réel
+- Gestion des erreurs et validations
+
+## II. SPÉCIFICATIONS TECHNIQUES DE L'API WAVE
+
+### 2.1 Endpoint Principal
+**POST** `/v1/checkout/sessions`
+
+### 2.2 Paramètres Requis
+- `amount` (obligatoire) : Montant en francs CFA (entier)
+- `currency` (obligatoire) : Code ISO devise (XOF uniquement)
+- `error_url` (obligatoire) : URL de redirection en cas d'erreur
+- `success_url` (obligatoire) : URL de redirection en cas de succès
+- `client_reference` (optionnel) : Identifiant unique client (max 255 caractères)
+- `aggregated_merchant_id` (obligatoire pour agrégateurs) : ID marchand
+
+### 2.3 Format de Réponse
+```json
+{
+  "id": "checkout_session_id",
+  "status": "pending",
+  "amount": 10000,
+  "currency": "XOF",
+  "client_reference": "ref_12345",
+  "wave_launch_url": "https://epsie.com/wave/pay/checkout_session_id",
+  "created_at": "2024-12-11T10:30:00Z",
+  "expires_at": "2024-12-11T11:30:00Z"
+}
+```
+
+### 2.4 États des Sessions
+- `pending` : En attente de paiement
+- `completed` : Paiement réussi
+- `failed` : Paiement échoué
+- `expired` : Session expirée
+- `cancelled` : Annulé par l'utilisateur
+
+## III. STRUCTURE DE LA BASE DE DONNÉES
+
+### 3.1 Table `checkout_sessions`
+```sql
+CREATE TABLE checkout_sessions (
+    id VARCHAR(50) PRIMARY KEY,
+    amount INT NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'XOF',
+    status ENUM('pending', 'completed', 'failed', 'expired', 'cancelled') DEFAULT 'pending',
+    client_reference VARCHAR(255),
+    aggregated_merchant_id VARCHAR(50),
+    success_url TEXT NOT NULL,
+    error_url TEXT NOT NULL,
+    wave_launch_url TEXT,
+    merchant_api_key VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP,
+    completed_at TIMESTAMP NULL,
+    INDEX idx_status (status),
+    INDEX idx_client_ref (client_reference),
+    INDEX idx_created (created_at)
+);
+```
+
+### 3.2 Table `api_keys`
+```sql
+CREATE TABLE api_keys (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    api_key VARCHAR(100) UNIQUE NOT NULL,
+    merchant_name VARCHAR(100) NOT NULL,
+    webhook_url TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP NULL
+);
+```
+
+### 3.3 Table `webhook_notifications`
+```sql
+CREATE TABLE webhook_notifications (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    session_id VARCHAR(50) NOT NULL,
+    webhook_url TEXT NOT NULL,
+    payload JSON NOT NULL,
+    status ENUM('pending', 'sent', 'failed') DEFAULT 'pending',
+    attempts INT DEFAULT 0,
+    last_attempt_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES checkout_sessions(id)
+);
+```
+
+### 3.4 Table `payment_logs`
+```sql
+CREATE TABLE payment_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    session_id VARCHAR(50) NOT NULL,
+    action VARCHAR(50) NOT NULL,
+    details JSON,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES checkout_sessions(id)
+);
+```
+
+## IV. ARCHITECTURE MVC
+
+### 4.1 Structure des Dossiers
+```
+/wave/
+├── api/
+│   ├── index.php (Point d'entrée API)
+│   ├── config/
+│   │   ├── database.php
+│   │   └── config.php
+│   ├── controllers/
+│   │   ├── CheckoutController.php
+│   │   ├── WebhookController.php
+│   │   └── PaymentController.php
+│   ├── models/
+│   │   ├── CheckoutSession.php
+│   │   ├── ApiKey.php
+│   │   └── WebhookNotification.php
+│   ├── services/
+│   │   ├── ValidationService.php
+│   │   ├── WebhookService.php
+│   │   └── PaymentSimulator.php
+│   └── utils/
+│       ├── Router.php
+│       ├── Response.php
+│       └── Security.php
+├── pay/ (Interface de paiement)
+│   ├── index.php
+│   ├── process.php
+│   └── assets/
+├── success/
+│   └── index.php
+├── error/
+│   └── index.php
+└── admin/ (Interface d'administration)
+    ├── dashboard.php
+    └── webhook-test.php
+```
+
+### 4.2 Configuration Database (config/database.php)
+```php
+<?php
+class Database {
+    private $host = 'localhost';
+    private $db_name = 'wave_simulation';
+    private $username = 'your_username';
+    private $password = 'your_password';
+    private $connection;
+
+    public function connect() {
+        $this->connection = null;
+        try {
+            $this->connection = new PDO(
+                "mysql:host=" . $this->host . ";dbname=" . $this->db_name,
+                $this->username,
+                $this->password,
+                [
+                    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8"
+                ]
+            );
+        } catch(PDOException $e) {
+            echo "Connection error: " . $e->getMessage();
+        }
+        return $this->connection;
+    }
+}
+?>
+```
+
+## V. IMPLÉMENTATION DES CONTRÔLEURS
+
+### 5.1 CheckoutController.php
+```php
+<?php
+class CheckoutController {
+    private $db;
+    private $checkoutSession;
+    private $validationService;
+
+    public function __construct($db) {
+        $this->db = $db;
+        $this->checkoutSession = new CheckoutSession($db);
+        $this->validationService = new ValidationService();
+    }
+
+    public function createSession() {
+        // Vérifier l'authentification API
+        $apiKey = $this->getApiKeyFromHeaders();
+        if (!$this->validateApiKey($apiKey)) {
+            Response::error(401, 'Invalid API key');
+            return;
+        }
+
+        // Récupérer et valider les données
+        $data = json_decode(file_get_contents('php://input'), true);
+        
+        $validation = $this->validationService->validateCheckoutData($data);
+        if (!$validation['valid']) {
+            Response::error(400, 'Validation failed', $validation['errors']);
+            return;
+        }
+
+        // Créer la session
+        $sessionId = $this->generateSessionId();
+        $expiresAt = date('Y-m-d H:i:s', strtotime('+1 hour'));
+        
+        $sessionData = [
+            'id' => $sessionId,
+            'amount' => $data['amount'],
+            'currency' => $data['currency'] ?? 'XOF',
+            'client_reference' => $data['client_reference'] ?? null,
+            'aggregated_merchant_id' => $data['aggregated_merchant_id'] ?? null,
+            'success_url' => $data['success_url'],
+            'error_url' => $data['error_url'],
+            'wave_launch_url' => $this->buildLaunchUrl($sessionId),
+            'merchant_api_key' => $apiKey,
+            'expires_at' => $expiresAt
+        ];
+
+        if ($this->checkoutSession->create($sessionData)) {
+            Response::success([
+                'id' => $sessionId,
+                'status' => 'pending',
+                'amount' => $data['amount'],
+                'currency' => $sessionData['currency'],
+                'client_reference' => $sessionData['client_reference'],
+                'wave_launch_url' => $sessionData['wave_launch_url'],
+                'created_at' => date('c'),
+                'expires_at' => date('c', strtotime($expiresAt))
+            ]);
+        } else {
+            Response::error(500, 'Failed to create checkout session');
+        }
+    }
+
+    private function generateSessionId() {
+        return 'cs_' . bin2hex(random_bytes(16));
+    }
+
+    private function buildLaunchUrl($sessionId) {
+        return "https://epsie.com/wave/pay/{$sessionId}";
+    }
+
+    private function getApiKeyFromHeaders() {
+        $headers = getallheaders();
+        return $headers['Authorization'] ?? $headers['authorization'] ?? null;
+    }
+
+    private function validateApiKey($apiKey) {
+        // Implémenter la validation de la clé API
+        $apiKeyModel = new ApiKey($this->db);
+        return $apiKeyModel->validate($apiKey);
+    }
+}
+?>
+```
+
+### 5.2 PaymentController.php
+```php
+<?php
+class PaymentController {
+    private $db;
+    private $checkoutSession;
+    private $webhookService;
+
+    public function __construct($db) {
+        $this->db = $db;
+        $this->checkoutSession = new CheckoutSession($db);
+        $this->webhookService = new WebhookService($db);
+    }
+
+    public function showPaymentPage($sessionId) {
+        $session = $this->checkoutSession->getById($sessionId);
+        
+        if (!$session) {
+            $this->redirectToError('Session not found');
+            return;
+        }
+
+        if ($session['status'] !== 'pending') {
+            $this->redirectToError('Session is not pending');
+            return;
+        }
+
+        if (strtotime($session['expires_at']) < time()) {
+            $this->checkoutSession->updateStatus($sessionId, 'expired');
+            $this->redirectToError('Session expired');
+            return;
+        }
+
+        // Afficher l'interface de paiement
+        $this->renderPaymentInterface($session);
+    }
+
+    public function processPayment() {
+        $sessionId = $_POST['session_id'] ?? null;
+        $action = $_POST['action'] ?? null; // 'pay' ou 'cancel'
+        
+        if (!$sessionId || !$action) {
+            Response::error(400, 'Missing required parameters');
+            return;
+        }
+
+        $session = $this->checkoutSession->getById($sessionId);
+        if (!$session || $session['status'] !== 'pending') {
+            Response::error(400, 'Invalid session');
+            return;
+        }
+
+        if ($action === 'pay') {
+            $this->processSuccessfulPayment($session);
+        } else if ($action === 'cancel') {
+            $this->processCancelledPayment($session);
+        }
+    }
+
+    private function processSuccessfulPayment($session) {
+        // Simuler un délai de traitement
+        sleep(2);
+        
+        // Mettre à jour le statut
+        $this->checkoutSession->updateStatus($session['id'], 'completed');
+        
+        // Envoyer le webhook
+        $this->webhookService->sendPaymentNotification($session, 'completed');
+        
+        // Logger l'action
+        $this->logPaymentAction($session['id'], 'payment_completed');
+        
+        // Rediriger vers la page de succès
+        header("Location: " . $session['success_url']);
+        exit;
+    }
+
+    private function processCancelledPayment($session) {
+        $this->checkoutSession->updateStatus($session['id'], 'cancelled');
+        $this->webhookService->sendPaymentNotification($session, 'cancelled');
+        $this->logPaymentAction($session['id'], 'payment_cancelled');
+        
+        header("Location: " . $session['error_url']);
+        exit;
+    }
+
+    private function renderPaymentInterface($session) {
+        // Interface HTML de simulation de paiement
+        include 'views/payment-interface.php';
+    }
+
+    private function redirectToError($message) {
+        header("Location: /wave/error?message=" . urlencode($message));
+        exit;
+    }
+
+    private function logPaymentAction($sessionId, $action, $details = null) {
+        $stmt = $this->db->prepare("
+            INSERT INTO payment_logs (session_id, action, details, ip_address, user_agent) 
+            VALUES (?, ?, ?, ?, ?)
+        ");
+        $stmt->execute([
+            $sessionId,
+            $action,
+            $details ? json_encode($details) : null,
+            $_SERVER['REMOTE_ADDR'] ?? null,
+            $_SERVER['HTTP_USER_AGENT'] ?? null
+        ]);
+    }
+}
+?>
+```
+
+## VI. MODÈLES DE DONNÉES
+
+### 6.1 CheckoutSession.php
+```php
+<?php
+class CheckoutSession {
+    private $db;
+
+    public function __construct($db) {
+        $this->db = $db;
+    }
+
+    public function create($data) {
+        $stmt = $this->db->prepare("
+            INSERT INTO checkout_sessions 
+            (id, amount, currency, client_reference, aggregated_merchant_id, 
+             success_url, error_url, wave_launch_url, merchant_api_key, expires_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        
+        return $stmt->execute([
+            $data['id'],
+            $data['amount'],
+            $data['currency'],
+            $data['client_reference'],
+            $data['aggregated_merchant_id'],
+            $data['success_url'],
+            $data['error_url'],
+            $data['wave_launch_url'],
+            $data['merchant_api_key'],
+            $data['expires_at']
+        ]);
+    }
+
+    public function getById($id) {
+        $stmt = $this->db->prepare("SELECT * FROM checkout_sessions WHERE id = ?");
+        $stmt->execute([$id]);
+        return $stmt->fetch();
+    }
+
+    public function updateStatus($id, $status) {
+        $completedAt = ($status === 'completed') ? date('Y-m-d H:i:s') : null;
+        $stmt = $this->db->prepare("
+            UPDATE checkout_sessions 
+            SET status = ?, completed_at = ? 
+            WHERE id = ?
+        ");
+        return $stmt->execute([$status, $completedAt, $id]);
+    }
+
+    public function getByClientReference($reference, $apiKey) {
+        $stmt = $this->db->prepare("
+            SELECT * FROM checkout_sessions 
+            WHERE client_reference = ? AND merchant_api_key = ?
+        ");
+        $stmt->execute([$reference, $apiKey]);
+        return $stmt->fetchAll();
+    }
+}
+?>
+```
+
+## VII. SERVICES
+
+### 7.1 ValidationService.php
+```php
+<?php
+class ValidationService {
+    
+    public function validateCheckoutData($data) {
+        $errors = [];
+        
+        // Vérifier les champs obligatoires
+        $required = ['amount', 'success_url', 'error_url'];
+        foreach ($required as $field) {
+            if (!isset($data[$field]) || empty($data[$field])) {
+                $errors[] = "Field '{$field}' is required";
+            }
+        }
+        
+        // Valider le montant
+        if (isset($data['amount'])) {
+            if (!is_int($data['amount']) || $data['amount'] <= 0) {
+                $errors[] = "Amount must be a positive integer";
+            }
+            if ($data['amount'] > 100000000) { // 1M XOF max
+                $errors[] = "Amount exceeds maximum limit";
+            }
+        }
+        
+        // Valider la devise
+        if (isset($data['currency'])) {
+            $supportedCurrencies = ['XOF', 'EUR', 'USD'];
+            if (!in_array($data['currency'], $supportedCurrencies)) {
+                $errors[] = "Currency not supported";
+            }
+        }
+        
+        // Valider les URLs
+        if (isset($data['success_url']) && !filter_var($data['success_url'], FILTER_VALIDATE_URL)) {
+            $errors[] = "Invalid success_url";
+        }
+        if (isset($data['error_url']) && !filter_var($data['error_url'], FILTER_VALIDATE_URL)) {
+            $errors[] = "Invalid error_url";
+        }
+        
+        // Valider client_reference
+        if (isset($data['client_reference']) && strlen($data['client_reference']) > 255) {
+            $errors[] = "client_reference too long (max 255 characters)";
+        }
+        
+        return [
+            'valid' => empty($errors),
+            'errors' => $errors
+        ];
+    }
+}
+?>
+```
+
+### 7.2 WebhookService.php
+```php
+<?php
+class WebhookService {
+    private $db;
+
+    public function __construct($db) {
+        $this->db = $db;
+    }
+
+    public function sendPaymentNotification($session, $status) {
+        // Récupérer l'URL webhook du marchand
+        $webhookUrl = $this->getWebhookUrl($session['merchant_api_key']);
+        
+        if (!$webhookUrl) {
+            return false;
+        }
+
+        $payload = [
+            'event' => 'checkout.session.' . $status,
+            'data' => [
+                'id' => $session['id'],
+                'status' => $status,
+                'amount' => $session['amount'],
+                'currency' => $session['currency'],
+                'client_reference' => $session['client_reference'],
+                'completed_at' => ($status === 'completed') ? date('c') : null
+            ],
+            'timestamp' => time()
+        ];
+
+        // Enregistrer la notification
+        $this->storeNotification($session['id'], $webhookUrl, $payload);
+        
+        // Envoyer la notification (asynchrone recommandé)
+        return $this->sendWebhook($webhookUrl, $payload);
+    }
+
+    private function sendWebhook($url, $payload) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode($payload),
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json',
+                'X-Wave-Signature: ' . $this->generateSignature($payload)
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 10,  // 10 secondes max comme Wave
+            CURLOPT_FOLLOWLOCATION => false
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // Marquer comme envoyé si succès (200-299)
+        $success = ($httpCode >= 200 && $httpCode < 300);
+        $this->updateNotificationStatus($payload['data']['id'], $success ? 'sent' : 'failed');
+        
+        return $success;
+    }
+
+    private function generateSignature($payload) {
+        // Générer une signature pour sécuriser le webhook
+        return hash_hmac('sha256', json_encode($payload), 'webhook_secret_key');
+    }
+
+    private function getWebhookUrl($apiKey) {
+        $stmt = $this->db->prepare("SELECT webhook_url FROM api_keys WHERE api_key = ?");
+        $stmt->execute([$apiKey]);
+        $result = $stmt->fetch();
+        return $result ? $result['webhook_url'] : null;
+    }
+
+    private function storeNotification($sessionId, $webhookUrl, $payload) {
+        $stmt = $this->db->prepare("
+            INSERT INTO webhook_notifications (session_id, webhook_url, payload) 
+            VALUES (?, ?, ?)
+        ");
+        return $stmt->execute([$sessionId, $webhookUrl, json_encode($payload)]);
+    }
+
+    private function updateNotificationStatus($sessionId, $status) {
+        $stmt = $this->db->prepare("
+            UPDATE webhook_notifications 
+            SET status = ?, last_attempt_at = NOW(), attempts = attempts + 1 
+            WHERE session_id = ?
+        ");
+        return $stmt->execute([$status, $sessionId]);
+    }
+}
+?>
+```
+
+## VIII. INTERFACE DE PAIEMENT
+
+### 8.1 Interface HTML (views/payment-interface.php)
+```html
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wave Payment Simulation</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 400px; margin: 50px auto; padding: 20px; }
+        .payment-card { border: 1px solid #ddd; border-radius: 8px; padding: 30px; }
+        .amount { font-size: 24px; font-weight: bold; color: #333; text-align: center; margin: 20px 0; }
+        .currency { color: #666; font-size: 18px; }
+        button { width: 100%; padding: 15px; margin: 10px 0; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
+        .pay-btn { background: #28a745; color: white; }
+        .cancel-btn { background: #dc3545; color: white; }
+        .info { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <div class="payment-card">
+        <h2>Simulation de Paiement Wave</h2>
+        
+        <div class="info">
+            <strong>Référence:</strong> <?= htmlspecialchars($session['client_reference'] ?? 'N/A') ?><br>
+            <strong>ID Session:</strong> <?= htmlspecialchars($session['id']) ?>
+        </div>
+        
+        <div class="amount">
+            <?= number_format($session['amount'] / 100, 0, ',', ' ') ?>
+            <span class="currency"><?= htmlspecialchars($session['currency']) ?></span>
+        </div>
+        
+        <form method="POST" action="/wave/pay/process">
+            <input type="hidden" name="session_id" value="<?= htmlspecialchars($session['id']) ?>">
+            
+            <button type="submit" name="action" value="pay" class="pay-btn">
+                Confirmer le Paiement
+            </button>
+            
+            <button type="submit" name="action" value="cancel" class="cancel-btn">
+                Annuler
+            </button>
+        </form>
+        
+        <div class="info" style="font-size: 12px; color: #666;">
+            ⚠️ Ceci est une simulation. Aucun vrai paiement ne sera effectué.
+        </div>
+    </div>
+</body>
+</html>
+```
+
+## IX. ROUTAGE ET POINT D'ENTRÉE
+
+### 9.1 Router.php
+```php
+<?php
+class Router {
+    private $routes = [];
+
+    public function addRoute($method, $path, $controller, $action) {
+        $this->routes[] = [
+            'method' => $method,
+            'path' => $path,
+            'controller' => $controller,
+            'action' => $action
+        ];
+    }
+
+    public function route() {
+        $method = $_SERVER['REQUEST_METHOD'];
+        $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+        
+        foreach ($this->routes as $route) {
+            if ($this->matchRoute($route, $method, $path)) {
+                $this->executeRoute($route, $path);
+                return;
+            }
+        }
+        
+        Response::error(404, 'Route not found');
+    }
+
+    private function matchRoute($route, $method, $path) {
+        if ($route['method'] !== $method) {
+            return false;
+        }
+        
+        $pattern = preg_replace('/\{([^}]+)\}/', '([^/]+)', $route['path']);
+        return preg_match('#^' . $pattern . '$#', $path);
+    }
+
+    private function executeRoute($route, $path) {
+        $database = new Database();
+        $db = $database->connect();
+        
+        $controllerClass = $route['controller'];
+        $controller = new $controllerClass($db);
+        
+        // Extraire les paramètres de l'URL
+        $pattern = preg_replace('/\{([^}]+)\}/', '([^/]+)', $route['path']);
+        preg_match('#^' . $pattern . '$#', $path, $matches);
+        array_shift($matches); // Supprimer le match complet
+        
+        call_user_func_array([$controller, $route['action']], $matches);
+    }
+}
+?>
+```
+
+### 9.2 Point d'entrée principal (api/index.php)
+```php
+<?php
+require_once 'config/database.php';
+require_once 'utils/Router.php';
+require_once 'utils/Response.php';
+require_once 'controllers/CheckoutController.php';
+require_once 'controllers/PaymentController.php';
+require_once 'controllers/WebhookController.php';
+require_once 'models/CheckoutSession.php';
+require_once 'models/ApiKey.php';
+require_once 'services/ValidationService.php';
+require_once 'services/WebhookService.php';
+
+header('Content-Type: application/json');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
+
+$router = new Router();
+
+// Routes API
+$router->addRoute('POST', '/wave/api/v1/checkout/sessions', 'CheckoutController', 'createSession');
+$router->addRoute('GET', '/wave/api/v1/checkout/sessions/{id}', 'CheckoutController', 'getSession');
+
+// Routes interface de paiement
+$router->addRoute('GET', '/wave/pay/{sessionId}', 'PaymentController', 'showPaymentPage');
+$router->addRoute('POST', '/wave/pay/process', 'PaymentController', 'processPayment');
+
+// Routes webhook
+$router->addRoute('POST', '/wave/webhook/test', 'WebhookController', 'testWebhook');
+
+$router->route();
+?>
+```
+
+## X. CLASSE UTILITAIRE RESPONSE
+
+### 10.1 Response.php
+```php
+<?php
+class Response {
+    public static function success($data = null, $code = 200) {
+        http_response_code($code);
+        echo json_encode([
+            'success' => true,
+            'data' => $data,
+            'timestamp' => date('c')
+        ], JSON_PRETTY_PRINT);
+        exit;
+    }
+
+    public static function error($code, $message, $details = null) {
+        http_response_code($code);
+        $response = [
+            'success' => false,
+            'error' => [
+                'code' => $code,
+                'message' => $message
+            ],
+            'timestamp' => date('c')
+        ];
+        
+        if ($details) {
+            $response['error']['details'] = $details;
+        }
+        
+        echo json_encode($response, JSON_PRETTY_PRINT);
+        exit;
+    }
+}
+?>
+```
+
+## XI. GESTION DES CLÉS API
+
+### 11.1 Système de génération et validation
+```php
+<?php
+class ApiKey {
+    private $db;
+
+    public function __construct($db) {
+        $this->db = $db;
+    }
+
+    public function generate($merchantName, $webhookUrl = null) {
+        $apiKey = 'wave_' . bin2hex(random_bytes(32));
+        
+        $stmt = $this->db->prepare("
+            INSERT INTO api_keys (api_key, merchant_name, webhook_url) 
+            VALUES (?, ?, ?)
+        ");
+        
+        if ($stmt->execute([$apiKey, $merchantName, $webhookUrl])) {
+            return $apiKey;
+        }
+        return false;
+    }
+
+    public function validate($apiKey) {
+        if (!$apiKey || !str_starts_with($apiKey, 'wave_')) {
+            return false;
+        }
+
+        $stmt = $this->db->prepare("
+            SELECT id FROM api_keys 
+            WHERE api_key = ? AND is_active = 1
+        ");
+        $stmt->execute([$apiKey]);
+        
+        $result = $stmt->fetch();
+        
+        if ($result) {
+            // Mettre à jour last_used_at
+            $this->updateLastUsed($apiKey);
+            return true;
+        }
+        
+        return false;
+    }
+
+    private function updateLastUsed($apiKey) {
+        $stmt = $this->db->prepare("
+            UPDATE api_keys SET last_used_at = NOW() WHERE api_key = ?
+        ");
+        $stmt->execute([$apiKey]);
+    }
+}
+?>
+```
