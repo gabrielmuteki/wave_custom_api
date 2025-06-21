@@ -109,12 +109,73 @@ class WebhookService {
 
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
         curl_close($ch);
 
-        $success = ($httpCode >= 200 && $httpCode < 300);
-        $this->updateNotificationStatus($notificationId, $success ? 'sent' : 'failed');
+        // Analyser la réponse
+        $responseData = [
+            'http_code' => $httpCode,
+            'response' => $response,
+            'error' => $error
+        ];
+
+        // Déterminer le statut en fonction de la réponse
+        $status = $this->determineWebhookStatus($httpCode, $response, $error);
+
+        // Mettre à jour la notification avec la réponse et le statut
+        $this->updateNotificationWithResponse($notificationId, $status, $responseData);
         
-        return $success;
+        return ($status === 'sent');
+    }
+
+    private function determineWebhookStatus($httpCode, $response, $error) {
+        if ($error) {
+            return 'failed';
+        }
+
+        if ($httpCode >= 200 && $httpCode < 300) {
+            // Vérifier si la réponse contient un statut spécifique
+            $responseData = json_decode($response, true);
+            if ($responseData && isset($responseData['status'])) {
+                switch (strtolower($responseData['status'])) {
+                    case 'success':
+                    case 'ok':
+                    case 'accepted':
+                        return 'sent';
+                    case 'error':
+                    case 'failed':
+                        return 'failed';
+                    default:
+                        return 'pending';
+                }
+            }
+            return 'sent';
+        }
+
+        if ($httpCode >= 500) {
+            return 'failed'; // Erreur serveur
+        }
+
+        return 'pending'; // Pour les autres codes HTTP
+    }
+
+    private function updateNotificationWithResponse($notificationId, $status, $responseData) {
+        $stmt = $this->db->prepare("
+            UPDATE webhook_notifications 
+            SET status = ?,
+                last_attempt_at = NOW(),
+                attempts = attempts + 1,
+                response_data = ?,
+                http_status_code = ?
+            WHERE id = ?
+        ");
+        
+        return $stmt->execute([
+            $status,
+            json_encode($responseData),
+            $responseData['http_code'],
+            $notificationId
+        ]);
     }
 
     private function generateSignature($payload) {
@@ -170,17 +231,27 @@ class WebhookService {
 
             $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
             curl_close($ch);
 
-            $success = ($httpCode >= 200 && $httpCode < 300);
-            
-            // Mettre à jour le statut de la notification
-            $this->updateNotificationStatus(
+            // Analyser la réponse
+            $responseData = [
+                'http_code' => $httpCode,
+                'response' => $response,
+                'error' => $error
+            ];
+
+            // Déterminer le statut en fonction de la réponse
+            $status = $this->determineWebhookStatus($httpCode, $response, $error);
+
+            // Mettre à jour la notification avec la réponse et le statut
+            $success = $this->updateNotificationWithResponse(
                 $notification['id'],
-                $success ? 'sent' : 'failed'
+                $status,
+                $responseData
             );
 
-            return $success;
+            return $success && ($status === 'sent');
 
         } catch (Exception $e) {
             error_log("Error resending webhook: " . $e->getMessage());
