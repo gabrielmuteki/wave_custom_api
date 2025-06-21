@@ -79,4 +79,8 @@ CREATE TABLE IF NOT EXISTS `downloads_counter` (
   `download_time` timestamp NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+ALTER TABLE webhook_notifications
+ADD COLUMN response_data JSON NULL,
+ADD COLUMN http_status_code INT NULL;
+
 COMMIT;
